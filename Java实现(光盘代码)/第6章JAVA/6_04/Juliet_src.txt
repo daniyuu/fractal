@@ -1,0 +1,482 @@
+import java.applet.*;
+import java.awt.*;
+
+// The main Mandelbrot/Julia applet
+public class Juliet extends Applet implements Runnable
+{
+	// Inner class for manipulating a complex number (real + imag*i)
+	public class ComplexPoint
+	{
+		// Default constructor
+		public ComplexPoint()
+		{
+			set(0,0);
+		};
+		
+		// Constructor with args
+		public ComplexPoint(double set_real, double set_imag)
+		{
+			set(set_real, set_imag);
+		};
+		
+		// Set to new values
+		public void set(double set_real, double set_imag)
+		{
+			real = set_real;
+			imag = set_imag;
+		};
+
+		// Set to equal another ComplexPoint
+		public void set(ComplexPoint p)
+		{
+			real = p.real;
+			imag = p.imag;
+		};
+		
+		// Add another ComplexPoint
+		public void add(ComplexPoint p)
+		{
+			real += p.real;
+			imag += p.imag;
+		};
+		
+		// Subtract another ComplexPoint
+		public void subtract(ComplexPoint p)
+		{
+			real -= p.real;
+			imag -= p.imag;
+		};
+		
+		// Mirror this ComplexPoint in the origo
+		public void negate()
+		{
+			real = -real;
+			imag = -imag;
+		};
+		
+		// Return the square of the distance from origo to this ComplexPoint
+		// (|p|^2 == (sqrt(p.r^2 + p.i^2))^2 == p.r^2 + p.i ^2)
+		// This is useful for comparing against a value, since the expression
+		// (p.r^2 + p.i ^2 > x^2) is faster than (sqrt(p.r^2 + p.i ^2) > x).
+		public double distance_squared()
+		{
+			return real*real + imag*imag;
+		};
+		
+		// Replace this ComplexPoint with its square
+		// (a+bi)^2 = (a+bi)(a+bi) = a^2 + 2abi + (bi)^2 = (a^2 - b^2) + (2ab)i
+		public void square()
+		{
+			double new_real = real*real - imag*imag;
+			double new_imag = 2*real*imag;
+			real = new_real;
+			imag = new_imag;
+		};
+		
+		// Replace this ComplexPoint with its square root
+		public void square_root()
+		{
+			// Square root calculation is easiest done in the polar plane
+			toPolar();
+			
+			radius = Math.sqrt(radius);
+			angle /= 2;
+			
+			// Convert back to normal (real,imag) plane
+			toCartesian();
+		};
+
+		// The actual real part and imaginary part values
+		public double real, imag;
+		
+		// Convert (internally) to polar representation (radius, angle)
+		private void toPolar()
+		{
+			radius = Math.sqrt(real*real + imag*imag);
+			
+			if (real > 0)
+				angle = Math.atan(imag/real);
+			else if (real < 0)
+				angle = Math.PI + Math.atan(imag/real);
+			else
+				angle = Math.PI;
+		};
+
+		// Convert (internally) back to cartesian representation (r,i)
+		private void toCartesian()
+		{
+			real = radius * Math.cos(angle);
+			imag = radius * Math.sin(angle);
+		};
+
+		// Internal variables for storing polar representation
+		private double radius, angle;
+	};
+	
+	// Max iterations for each pixel in Mandelbrot and Julia sets:
+	final int MAX_ITERATIONS = 200;
+
+	// This many of the first iterations are discarded in the fast and
+	// sketchy Julia set plotting:
+	final int JULIASKETCH_DISCARD = 10;
+	
+	// After this many iterations, the fast and sketchy Julia set plotting
+	// is replaced by the slower, complete and more colorful algorithm:
+	final int JULIASKETCH_REFINE = 10000;
+	
+	// Portion of Mandelbrot set to be displayed:
+	final double REAL_LO = -0.50, REAL_HI = 2.00;
+	final double IMAG_LO = -1.25, IMAG_HI = 1.25;
+
+	// Max size (in complex coords) of Julia set
+	final double JULIASIZE = 4.0;
+	
+	final int CROSSHAIR_SIZE = 10; // Size of crosshairs
+	
+	int SIZE = 150; // Default value for canvas size
+	
+	ComplexPoint step = new ComplexPoint();
+
+	// Variables used in the iteration formulae
+	ComplexPoint z = new ComplexPoint();
+	ComplexPoint c = new ComplexPoint();
+	ComplexPoint p = new ComplexPoint();
+	ComplexPoint u = new ComplexPoint();
+	
+	Point crosshair = new Point(); // cross hair position
+
+	boolean restart_julia;
+
+	Color palette[] = new Color[MAX_ITERATIONS];
+	
+	Image mandel;	// Offscreen bitmap for Mandelbrot
+	Image julia;	// Offscreen bitmap for Julia
+
+	Graphics gm;
+	Graphics gj;
+	Graphics screen;
+		
+	Thread juliathread = null;
+
+	public String getAppletInfo()
+	{
+		return "Name: Juliet\r\nAuthor: Göran Wallgren";
+	}
+
+	public void init() // Applet initialization
+	{
+		// Read canvas size from applet parameters
+		String param = getParameter("size");
+		if (param != null)
+		{
+			SIZE = Integer.parseInt(param);
+		}
+
+		// Calculate the size of one pixel in the Mandelbrot image,
+		// mapped to our portion of the complex number plane
+		step.real = (REAL_HI - REAL_LO)/SIZE;
+		step.imag = (IMAG_HI - IMAG_LO)/SIZE;
+
+		// Position crosshairs at origo
+		crosshair.setLocation((int)(-REAL_LO / step.real),
+							  (int)(-IMAG_LO / step.imag));
+
+		// Setup applet drawing area
+		setBackground(Color.black);
+		resize(2*SIZE, SIZE);
+
+		// Create offscreen bitmaps for drawing the Mandelbrot and Julia sets
+		mandel = createImage(SIZE, SIZE);
+		julia  = createImage(SIZE, SIZE);
+
+		// Setup handles to offscreen bitmaps and screen drawing area
+		gm = mandel.getGraphics();	initBitmap(gm);
+		gj = julia.getGraphics();	initBitmap(gj);
+		screen = getGraphics();
+		
+		// Create a smooth color palette with MAX_ITERATIONS entries
+		double colfactor = 255.0 / Math.log((double)(MAX_ITERATIONS + 1));
+		int level;
+		for (int n = 0; n < MAX_ITERATIONS; n++)
+		{
+			level = (int)(colfactor * Math.log(n + 1));
+			palette[n] = new Color(level, level, 255-level);
+		}
+	}
+
+	public void start() // Enter thread
+	{
+		if (juliathread == null)
+		{
+			juliathread = new Thread(this);
+			juliathread.start();
+		}
+	}
+	
+	public void stop() // Exit thread
+	{
+		if (juliathread != null)
+		{
+			juliathread.stop();
+			juliathread = null;
+		}
+	}
+
+	public void run() // Thread entry point, from interface Runnable
+	{
+		// Build and draw the Mandelbrot set image
+		drawColoredMandel();
+
+		// Enter the Julia set drawing loop
+		drawJuliaInteractively();
+	}
+
+	// Called whenever a portion of the applet needs to be redrawn.
+	// Override the default since we don't need to erase...
+	public void update(Graphics g)
+	{
+		paint(g);
+	}
+
+	// Called from update()...
+	public void paint(Graphics g)
+	{
+		// Paste the saved images onto screen, and apply the crosshairs
+		g.drawImage(julia,  SIZE, 0, this);
+		g.drawImage(mandel, 0,    0, this);
+		drawCrosshairs(g);
+	}
+
+	// Helper function
+	void drawPixel(Graphics g, int xx, int yy)
+	{
+		g.drawLine(xx, yy, xx, yy);
+	}
+
+	// Helper function
+	void initBitmap(Graphics g)
+	{
+		// Initialize offscreen bitmaps with black background and white border
+		g.setColor(Color.black); g.fillRect(1,1, SIZE-2,SIZE-2);
+		g.setColor(Color.white); g.drawRect(0,0, SIZE-1,SIZE-1);
+		repaint(); // Update screen
+	}
+	
+	// Draw an image of the Mandelbrot set in memory and on screen
+	void drawJuliaInteractively()
+	{
+		final double JULIASCALE = (double)SIZE / JULIASIZE;
+		final int    CENTRE_X   = SIZE + SIZE/2;
+		final int    CENTRE_Y   = SIZE/2;
+
+		int iter = 0; // Counter for iterations
+
+		// Make sure parameters will be initialized when we enter the eternal loop		
+		restart_julia = true;
+		
+		// Loop forever, drawing the selected Julia set using a fast and sketchy
+		// plotting at first, then replacing it with the complete algorithm...
+		while (true)
+		{
+			// The restart_julia flag is set when the crosshairs are moved
+			if (restart_julia)
+			{
+				initBitmap(gj);
+
+				// Update value of c with new crosshair position
+				c.set(REAL_LO + step.real * crosshair.x,
+					  IMAG_LO + step.imag * crosshair.y);
+
+				// Reset starting point for Julia iterations
+				iter = 0;
+				z.set(1,1);
+
+				// Reset flag
+				restart_julia = false;
+			}
+
+			// Perform one iteration step of the "sketchy" Julia set formula.
+			// Here, the "z := z^2 - c" formula is traced "backwards" using
+			// its inverse "z := sqrt(z + c)". The calculation is separated
+			// into two steps: "z := z + c" followed by z := sqrt(z).
+			z.add(c); z.square_root();
+
+			// However, there are actually two possible solutions (+/-) to
+			// the sqrt() equation, so we choose randomly between the two...
+			if (Math.random() < 0.50)
+			{
+				z.negate(); // In 50% of the cases, choose the negative solution
+			}
+			
+			// The earliest iterations are discarded...
+			if (iter > JULIASKETCH_DISCARD)
+			{
+				// After this many iterations, take a break and calculate a more
+				// colorful image of this Julia set...
+				if (iter == JULIASKETCH_REFINE)
+				{
+					drawColoredJulia();
+				}
+			
+				// Iterations are stopped after the colored Julia image
+				// has been drawn...
+				if (iter < JULIASKETCH_REFINE)
+				{
+					// Draw on screen. Please note: for each iteration, both of
+					// the possible (+/-) solutions are drawn!
+					screen.setColor(Color.yellow);
+					drawPixel(screen, CENTRE_X + (int)(JULIASCALE*z.real),
+							          CENTRE_Y + (int)(JULIASCALE*z.imag));
+					drawPixel(screen, CENTRE_X - (int)(JULIASCALE*z.real),
+							          CENTRE_Y - (int)(JULIASCALE*z.imag));
+				}
+			}
+			
+			// Increase iteration counter
+			iter++;
+		}
+	}
+	
+	// Draw an image of the Julia set in memory and (later) on screen
+	void drawColoredJulia()
+	{
+		final double STEPSIZE = JULIASIZE / (double)SIZE;
+		
+		int x, y;		// Screen pixel coordinates
+		int iter;		// Counter for iterations
+
+		// For each pixel in the (yet to be) Julia picture, keep
+		// track of the corresponding value (u) in the complex
+		// plane and use that as the starting point for iterating
+		// the Julia/Mandelbrot formula. z and c are replaced by
+		// p and u, so as not to disturb the calculations made
+		// in drawJuliaInteractively().
+		
+		u.imag = -JULIASIZE / 2.0 + STEPSIZE;
+		for (y = 1; y < SIZE-1; y++)
+		{
+			u.real = -JULIASIZE / 2.0 + STEPSIZE;
+			for (x = 1; x < SIZE-1; x++)
+			{
+				// Start iterating at current point (u)
+				p.set(u);
+				
+				for (iter = 0; iter < MAX_ITERATIONS; iter++)
+				{
+					// Check if z is growing towards infinity: "|z| > 2" ==> "|z|^2 > 4"
+					if (p.distance_squared() > 4.0)
+					{
+						// OK, this point is outside the Julia set.
+						// Plot this point in memory, colored according to
+						// the number of iterations made.
+						gj.setColor(palette[iter]);				//screen.setColor(palette[iter]);
+						drawPixel(gj, x, y);					//drawPixel(screen, SIZE + x, y);
+						break; // Continue with next point...
+					}
+					
+					// Calculate "z := z^2 - c"
+					p.square(); p.subtract(c);
+				}
+				// Points inside the Julia set are not drawn, instead they
+				// will keep the background color (black).
+				
+				// Abort if user moved the crosshairs!
+				if (restart_julia) return;
+					
+				u.real += STEPSIZE;
+			}
+			u.imag += STEPSIZE;
+		}
+		repaint(); // Update screen
+	}
+
+	// Draw an image of the Mandelbrot set in memory and on screen
+	void drawColoredMandel()
+	{
+		int x, y;		// Screen pixel coordinates
+		int y_mirrored;	// Mirrored y-coordinate
+		int iter;		// Counter for iterations
+
+		// For each pixel in the (yet to be) Mandelbrot picture,
+		// keep track of the corresponding value of the constant c
+		// in the complex plane and iterate the Mandelbrot formula
+		// using that value. Since the Mandelbrot set is vertically
+		// symmetric, points are mirrored along the horiz. axis (x).
+		
+		c.imag = IMAG_LO + step.imag;
+		for (y = 1; y < SIZE/2; y++)
+		{
+			y_mirrored = SIZE - 1 - y;
+			
+			c.real = REAL_LO + step.real;
+			for (x = 1; x < SIZE-1; x++)
+			{
+				// Start iterating at (0,0)
+				z.set(0,0);
+				
+				for (iter = 0; iter < MAX_ITERATIONS; iter++)
+				{
+					// Check if z is growing towards infinity: "|z| > 2" ==> "|z|^2 > 4"
+					if (z.distance_squared() > 4.0)
+					{
+						// OK, this point is outside the Mandelbrot set.
+						// Plot this point in memory and on screen, colored according to
+						// the number of iterations made.
+						gm.setColor(palette[iter]);		screen.setColor(palette[iter]);
+						drawPixel(gm, x, y);			drawPixel(screen, x, y);
+						drawPixel(gm, x, y_mirrored);	drawPixel(screen, x, y_mirrored);
+						break; // Continue with next point...
+					}
+					
+					// Calculate "z := z^2 - c"
+					z.square(); z.subtract(c);
+				}
+				// Points inside the Mandelbrot set are not drawn, instead they
+				// will keep the background color (black).
+				
+				c.real += step.real;
+			}
+			c.imag += step.imag;
+		}
+	}
+
+	// Draw crosshairs over the Mandelbrot image using XOR mode for simple animation
+	void drawCrosshairs(Graphics g)
+	{
+		g.setXORMode(Color.white);
+		
+		g.drawLine(crosshair.x - CROSSHAIR_SIZE, crosshair.y,
+				   crosshair.x + CROSSHAIR_SIZE, crosshair.y);
+		g.drawLine(crosshair.x, crosshair.y - CROSSHAIR_SIZE,
+				   crosshair.x, crosshair.y + CROSSHAIR_SIZE);
+		
+		g.setPaintMode();
+	}
+
+	// Called when mouse pointer is moving while mouse button is being pressed
+	public boolean mouseDrag(Event evt, int x, int y)
+	{
+		// Check if mouse pointer is inside Mandelbrot image
+		if (x >= 0 && x < SIZE && y >= 0 && y < SIZE)
+		{
+			// Update crosshair position
+			crosshair.x = x;
+			crosshair.y = y;
+
+			// Julia set calculation will be restarted at next iteration of the
+			// drawJuliaInteractively() function, which is running in a separate
+			// thread (juliathread).
+			restart_julia = true;
+		}
+		return true;
+	}
+
+	// Called when mouse button is pressed
+	public boolean mouseDown(Event evt, int x, int y)
+	{
+		// Same action as for mouse dragging
+		return mouseDrag(evt, x, y);
+	}
+}
+
+
